@@ -1,26 +1,43 @@
-# config.py
+# Import required libraries
+import json
+import os
+import time
 from pathlib import Path
+import tempfile
+import subprocess
 from dataclasses import dataclass
-from typing import List, Literal
+from typing import Dict, List, Literal, NamedTuple
+import optuna
 
 
+# Configuration classes to store settings
 @dataclass
-class SlurmConfig:
-    mem_per_task: str = "2G"
-    cpus_per_task: int = 2
-    base_runtime_factor: float = 1.2  # 20% buffer
-    simulations_per_script: int = 50
+class SlurmSettings:
+    """Settings for SLURM job submission"""
+
+    memory_per_task: str = "2G"  # Amount of memory allocated per task
+    cpus_per_task: int = 2  # Number of CPUs per task
+    time_buffer: float = 1.2  # Add 20% buffer to estimated runtime
+    jobs_per_batch: int = 50  # Number of simulations to run per script
+
+    # Software versions
     julia_version: str = "1.5.3"
     r_version: str = "4.0.3"
 
 
 @dataclass
-class PathConfig:
+class Paths:
+    """Manages all file paths used in the project"""
+
+    # Get the directory where this script is located
     base_dir: Path = Path(__file__).resolve().parent
     scripts_dir: Path = base_dir / "scripts"
+
+    # Dictionary mapping analysis names to their script files
     analysis_scripts: dict = None
 
     def __post_init__(self):
+        """Set up the script paths after initialization"""
         self.analysis_scripts = {
             "radial_search": self.scripts_dir / "radial_search.jl",
             "elastic_net": self.scripts_dir / "elastic_net.R",
@@ -29,130 +46,159 @@ class PathConfig:
 
 
 @dataclass
-class StudyConfig:
+class StudySettings:
+    """Settings for the Optuna optimization study"""
+
     name: str = "variable_selection_benchmark"
-    db_url: str = "sqlite:///benchmark_study.db"
-    n_trials: int = 100
+    database_url: str = "sqlite:///benchmark_study.db"
+    num_trials: int = 100
     direction: Literal["maximize", "minimize"] = "maximize"
 
 
-import optuna
-import subprocess
-import json
-import os
-import time
-from pathlib import Path
-from typing import Dict, Any, List, NamedTuple
-import tempfile
-
-
+# Class to store information about submitted jobs
 class JobInfo(NamedTuple):
-    job_id: str
-    output_file: str
-    slurm_script: str
+    """Stores information about a submitted SLURM job"""
+
+    job_id: str  # SLURM job ID
+    output_file: str  # Path to output file
+    slurm_script: str  # Path to SLURM script
 
 
 class BenchmarkRunner:
-    def __init__(
-        self,
-        slurm_config: SlurmConfig = SlurmConfig(),
-        path_config: PathConfig = PathConfig(),
-        study_config: StudyConfig = StudyConfig(),
-    ):
-        self.slurm_config = slurm_config
-        self.path_config = path_config
-        self.study_config = study_config
+    """Main class for running benchmarks using SLURM"""
+
+    def __init__(self):
+        """Initialize the benchmark runner with default settings"""
+        self.slurm = SlurmSettings()
+        self.paths = Paths()
+        self.study = StudySettings()
+
+        # Create temporary directory for outputs
         self.output_dir = Path(tempfile.gettempdir()) / "benchmark_outputs"
         self.output_dir.mkdir(exist_ok=True)
 
-    def estimate_runtime(self, params: Dict[str, Any]) -> str:
-        """Estimate runtime based on parameter settings."""
-        base_time = (params["n"] * params["p"]) / 1000000
+    def calculate_runtime(self, params: Dict) -> str:
+        """
+        Calculate estimated runtime for a job based on input parameters
+
+        Args:
+            params: Dictionary containing 'n' (sample size) and 'p' (number of variables)
+
+        Returns:
+            String in format "days-hours:minutes:00"
+        """
+        # Basic calculation: (n * p) / 1M gives base time in minutes
+        base_minutes = (params["n"] * params["p"]) / 1000000
+
+        # Apply job batch size and safety buffer
         total_minutes = (
-            base_time
-            * self.slurm_config.simulations_per_script
-            * self.slurm_config.base_runtime_factor
+            base_minutes * self.slurm.jobs_per_batch * self.slurm.time_buffer
         )
 
+        # Convert to days, hours, minutes
         days = int(total_minutes // (24 * 60))
         hours = int((total_minutes % (24 * 60)) // 60)
         minutes = int(total_minutes % 60)
 
         return f"{days}-{hours:02d}:{minutes:02d}:00"
 
-    def create_slurm_script(
-        self,
-        script_path: Path,
-        params: Dict[str, Any],
-        output_file: str,
-        time_limit: str,
+    def create_job_script(
+        self, script_path: Path, params: Dict, output_file: str, time_limit: str
     ) -> str:
-        """Create a SLURM submission script."""
+        """
+        Create a SLURM submission script
+
+        Args:
+            script_path: Path to the analysis script
+            params: Dictionary of parameters to pass to the script
+            output_file: Where to save the results
+            time_limit: Maximum runtime for the job
+
+        Returns:
+            Path to the created SLURM script
+        """
+        # Create temporary directory for SLURM scripts
         script_dir = Path(tempfile.gettempdir())
         slurm_script = script_dir / f"slurm_{script_path.stem}.sh"
 
-        # Determine the environment setup based on file type
+        # Set up environment based on script type
         if script_path.suffix == ".jl":
-            module_load = f"module load julia/{self.slurm_config.julia_version}"
-            run_cmd = f"julia {script_path}"
+            env_setup = f"module load julia/{self.slurm.julia_version}"
+            run_command = f"julia {script_path}"
         elif script_path.suffix == ".R":
-            module_load = f"module load R/{self.slurm_config.r_version}"
-            run_cmd = f"Rscript {script_path}"
+            env_setup = f"module load R/{self.slurm.r_version}"
+            run_command = f"Rscript {script_path}"
         else:
-            raise ValueError(f"Unknown script type: {script_path}")
+            raise ValueError(f"Unsupported script type: {script_path}")
 
-        content = f"""#!/bin/bash
+        # Create the SLURM script content
+        script_content = f"""#!/bin/bash
 #SBATCH --time={time_limit}
 #SBATCH --output={output_file}.log
 #SBATCH --error={output_file}.err
 #SBATCH --job-name={script_path.stem}
-#SBATCH --mem={self.slurm_config.mem_per_task}
-#SBATCH --cpus-per-task={self.slurm_config.cpus_per_task}
+#SBATCH --mem={self.slurm.memory_per_task}
+#SBATCH --cpus-per-task={self.slurm.cpus_per_task}
 
-# Load required module
-{module_load}
+# Load required software
+{env_setup}
 
-# Set up environment variables
+# Set up parallel processing environment
 export OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK
 export JULIA_NUM_THREADS=$SLURM_CPUS_PER_TASK
 export R_NUM_THREADS=$SLURM_CPUS_PER_TASK
 
-# Run the analysis script
-{run_cmd} {params['n']} {params['p']} \
+# Run the analysis script with parameters
+{run_command} {params['n']} {params['p']} \
 {params['small_big_beta_ratio']} {params['small_beta_proportion']} \
 {params['covariance_structure']} {output_file}
 """
-
-        slurm_script.write_text(content)
+        # Write script to file
+        slurm_script.write_text(script_content)
         return str(slurm_script)
 
-    def submit_jobs(self, params: Dict[str, Any]) -> List[JobInfo]:
-        """Submit all jobs to SLURM and return their information."""
-        time_limit = self.estimate_runtime(params)
-        jobs = []
+    def submit_jobs(self, params: Dict) -> List[JobInfo]:
+        """
+        Submit all analysis jobs to SLURM
 
-        for script_name, script_path in self.path_config.analysis_scripts.items():
+        Args:
+            params: Dictionary of parameters for the analysis
+
+        Returns:
+            List of JobInfo objects for submitted jobs
+        """
+        time_limit = self.calculate_runtime(params)
+        submitted_jobs = []
+
+        # Submit each analysis script as a separate job
+        for script_name, script_path in self.paths.analysis_scripts.items():
             output_file = str(self.output_dir / f"{script_name}_output.json")
-            slurm_script = self.create_slurm_script(
+            slurm_script = self.create_job_script(
                 script_path, params, output_file, time_limit
             )
 
+            # Submit the job using sbatch
             result = subprocess.run(
                 ["sbatch", slurm_script], capture_output=True, text=True
             )
 
             if result.returncode != 0:
-                raise RuntimeError(f"Job submission failed: {result.stderr}")
+                raise RuntimeError(f"Failed to submit job: {result.stderr}")
 
             job_id = result.stdout.strip().split()[-1]
-            jobs.append(JobInfo(job_id, output_file, slurm_script))
+            submitted_jobs.append(JobInfo(job_id, output_file, slurm_script))
 
-        return jobs
+        return submitted_jobs
 
-    @staticmethod
-    def wait_for_jobs(jobs: List[JobInfo]) -> None:
-        """Wait for all jobs to complete."""
+    def wait_for_completion(self, jobs: List[JobInfo]) -> None:
+        """
+        Wait for all submitted jobs to complete
+
+        Args:
+            jobs: List of submitted JobInfo objects
+        """
         while True:
+            # Check for any jobs still in the queue
             pending_jobs = [
                 job
                 for job in jobs
@@ -164,52 +210,83 @@ export R_NUM_THREADS=$SLURM_CPUS_PER_TASK
             if not pending_jobs:
                 break
 
+            # Wait 30 seconds before checking again
             time.sleep(30)
 
-    def collect_results(self, jobs: List[JobInfo]) -> List[Dict[str, float]]:
-        """Collect results from all output files."""
+    def get_results(self, jobs: List[JobInfo]) -> List[Dict]:
+        """
+        Collect results from all completed jobs
+
+        Args:
+            jobs: List of completed JobInfo objects
+
+        Returns:
+            List of result dictionaries from each job
+        """
         results = []
         for job in jobs:
             try:
+                # Read and parse the JSON output file
                 results.append(json.loads(Path(job.output_file).read_text()))
-            except (FileNotFoundError, json.JSONDecodeError) as e:
-                error_content = self._get_error_content(job.output_file)
+            except Exception as e:
+                # If there's an error, try to get more information from log files
+                error_logs = self._read_error_logs(job.output_file)
                 raise RuntimeError(
-                    f"Failed to collect results from {job.output_file}. "
-                    f"Error: {str(e)}. Error/Log output: {error_content}"
+                    f"Failed to get results from {job.output_file}. "
+                    f"Error: {str(e)}. Logs: {error_logs}"
                 )
         return results
 
-    @staticmethod
-    def _get_error_content(output_file: str) -> str:
-        """Get content from error and log files if they exist."""
+    def _read_error_logs(self, output_file: str) -> str:
+        """Read content from error and log files if they exist"""
         error_content = []
         for suffix in [".err", ".log"]:
             try:
-                file_content = Path(output_file).with_suffix(suffix).read_text()
-                error_content.append(f"{suffix} output:\n{file_content}")
+                content = Path(output_file).with_suffix(suffix).read_text()
+                error_content.append(f"{suffix} content:\n{content}")
             except Exception:
                 continue
         return "\n".join(error_content)
 
-    @staticmethod
-    def cleanup_files(jobs: List[JobInfo]) -> None:
-        """Clean up temporary files."""
+    def cleanup(self, jobs: List[JobInfo]) -> None:
+        """
+        Clean up temporary files after jobs complete
+
+        Args:
+            jobs: List of completed JobInfo objects
+        """
         for job in jobs:
             for file in [job.output_file, job.slurm_script]:
                 try:
                     os.remove(file)
+                    # Also remove log and error files
                     for suffix in [".log", ".err"]:
-                        os.remove(Path(file).with_suffix(suffix))
+                        os.remove(f"{file}{suffix}")
                 except FileNotFoundError:
                     continue
 
 
 def main():
+    """Main function to run the benchmark study"""
     runner = BenchmarkRunner()
 
     def objective(trial: optuna.Trial) -> float:
-        """Optuna objective function that runs all three scripts and combines their metrics."""
+        """
+        Objective function for Optuna optimization
+
+        This function:
+        1. Generates parameters using Optuna
+        2. Submits jobs with these parameters
+        3. Waits for completion
+        4. Collects and averages results
+
+        Args:
+            trial: Optuna trial object
+
+        Returns:
+            Average F1 score across all methods
+        """
+        # Generate parameters for this trial
         params = {
             "n": trial.suggest_int("n", 100, 10000),
             "p": trial.suggest_int("p", 10, 1000),
@@ -225,23 +302,27 @@ def main():
             ),
         }
 
+        # Submit and run jobs
         jobs = runner.submit_jobs(params)
 
         try:
-            runner.wait_for_jobs(jobs)
-            results = runner.collect_results(jobs)
+            runner.wait_for_completion(jobs)
+            results = runner.get_results(jobs)
+            # Calculate average F1 score
             return sum(r["f1"] for r in results) / len(results)
         finally:
-            runner.cleanup_files(jobs)
+            # Always clean up, even if there's an error
+            runner.cleanup(jobs)
 
+    # Create and run the Optuna study
     study = optuna.create_study(
-        study_name=runner.study_config.name,
-        storage=runner.study_config.db_url,
+        study_name=runner.study.name,
+        storage=runner.study.database_url,
         load_if_exists=True,
-        direction=runner.study_config.direction,
+        direction=runner.study.direction,
     )
 
-    study.optimize(objective, n_trials=runner.study_config.n_trials)
+    study.optimize(objective, n_trials=runner.study.num_trials)
 
 
 if __name__ == "__main__":
